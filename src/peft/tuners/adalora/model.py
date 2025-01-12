@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import warnings
+from typing import Optional
 
 import torch
 from transformers.pytorch_utils import Conv1D
@@ -356,3 +357,109 @@ class AdaLoraModel(LoraModel):
     def add_weighted_adapter(self, *args, **kwargs):
         """This method is not supported for AdaLoRA, use LoRA instead."""
         raise TypeError(f"{self.__class__.__name__} does not support add_weighted_adapter method.")
+
+    def _unload_and_optionally_merge(
+        self,
+        merge: bool = True,
+        safe_merge: bool = False,
+        adapter_names: Optional[list[str]] = None,
+        eps: float = 1e-5,
+    ) -> torch.nn.Module:
+        """
+        This method unloads the AdaLoRA adapter modules and optionally merges them into the base model weights.
+
+        Args:
+            merge (`bool`, defaults to `True`):
+                If True, merges the adapter weights into base model weights.
+                If False, it will only unload the adapters without merging.
+            safe_merge (`bool`, defaults to `False`):
+                If True, performs the merge operation with extra safety checks.
+            adapter_names (`List[str]`, *optional*):
+                The list of adapter names to merge. If None, all active adapters will be merged.
+            eps (`float`, defaults to 1e-5):
+                Small constant for numerical stability when dividing by ranknum.
+
+        Returns:
+            model (`torch.nn.Module`):
+                The resulting PyTorch model.
+        """
+        if getattr(self.model, "is_loaded_in_8bit", False):
+            raise ValueError("Cannot merge adalora layers when the model is loaded in 8-bit mode")
+
+        if getattr(self.model, "is_loaded_in_4bit", False):
+            raise ValueError("Cannot merge adalora layers when the model is loaded in 4-bit mode")
+
+        if adapter_names is not None:
+            raise ValueError("AdaLoRA does not support merging specific adapters. Got adapter_names={adapter_names}")
+
+        # Create a copy of the base model state dict to modify
+        original_state_dict = self.model.state_dict()
+
+        if merge:
+            for name, module in self.model.named_modules():
+                if hasattr(module, "base_layer") and hasattr(module, "lora_A"):
+                    # Extract base layer weight name
+                    layer_name = name.replace(".lora_A", "")
+                    layer_name = layer_name.replace("base_model.model.", "")
+                    base_weight_name = f"{layer_name}.weight"
+
+                    # Get SVD parameters
+                    lora_A = module.lora_A["default"]  # [r x d_in]
+                    lora_B = module.lora_B["default"]  # [d_out x r]
+                    lora_E = module.lora_E["default"]  # [r x 1]
+
+                    # Calculate active ranks
+                    ranknum = (lora_E != 0).sum()
+                    scaling = module.scaling["default"] if hasattr(module, "scaling") else 16
+
+                    # Safety check if requested
+                    if safe_merge and (
+                        torch.isnan(lora_A).any() or torch.isnan(lora_B).any() or torch.isnan(lora_E).any()
+                    ):
+                        raise ValueError(f"NaN detected in adapter weights for layer {name}")
+
+                    # Scale A with E: A' = AE
+                    scaled_A = lora_A * lora_E  # [r x d_in]
+
+                    # Compute update: ΔW = BA'
+                    if ranknum > 0:
+                        update = (lora_B @ scaled_A) * scaling / (ranknum + eps)
+                    else:
+                        update = torch.zeros_like(original_state_dict[base_weight_name])
+
+                    # Update base weights
+                    if base_weight_name in original_state_dict:
+                        original_state_dict[base_weight_name] += update
+
+        # Load the merged state dict back into a clean version of the model
+        self.model.load_state_dict(original_state_dict)
+
+        return self.model
+
+    def merge_and_unload(
+        self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None, eps: float = 1e-5
+    ) -> torch.nn.Module:
+        """
+        Merge the active adapters into the base model and unload the adapters.
+
+        Args:
+            safe_merge (`bool`, defaults to `False`):
+                If True, performs the merge operation with extra safety checks.
+            adapter_names (`List[str]`, *optional*):
+                List of adapter names to merge. If None, merges all active adapters.
+            eps (`float`, defaults to 1e-5):
+                Small constant for numerical stability when dividing by ranknum.
+
+        Returns:
+            `torch.nn.Module`: The merged model.
+        """
+        return self._unload_and_optionally_merge(safe_merge=safe_merge, adapter_names=adapter_names, eps=eps)
+
+    def unload(self) -> torch.nn.Module:
+        """
+        Unload the adapters without merging them into the base model.
+
+        Returns:
+            `torch.nn.Module`: The unloaded model.
+        """
+        return self._unload_and_optionally_merge(merge=False)
